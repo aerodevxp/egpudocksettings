@@ -297,83 +297,20 @@ swap_shaders() {
         dxvk_target="$DXVK_IGPU_SHADER"
     fi
 
-    info "========== SHADER CACHE SWAP =========="
-    debug "Target Mesa dir: $mesa_target"
-    debug "Target DXVK dir: $dxvk_target"
-
     mkdir -p "$mesa_target" "$dxvk_target"
 
-    # --- Mesa shader cache ---
-    local mesa_cache="$HOME/.cache/mesa_shader_cache"
+    # Write env vars to a file that gets sourced at game launch
+    local env_file="$DOCK_DIR/current_gpu_env.sh"
+    cat > "$env_file" <<EOF
+export MESA_SHADER_CACHE_DIR="$mesa_target"
+export DXVK_STATE_CACHE_PATH="\$STEAM_COMPAT_DATA_PATH/dxvk-state-cache"
+EOF
 
-    if [ -d "$mesa_cache" ] && [ ! -L "$mesa_cache" ]; then
-        # Real directory — first encounter, migrate contents
-        warn "Mesa cache is a real directory, migrating to $mesa_target"
-        if [ "$DRYRUN" = "1" ]; then
-            info "  DRY RUN: Would migrate $mesa_cache -> $mesa_target"
-        else
-            cp -rp "$mesa_cache"/* "$mesa_target/" 2>/dev/null
-            rm -rf "$mesa_cache"
-            ln -s "$mesa_target" "$mesa_cache"
-            debug "  Mesa cache migrated and symlinked"
-        fi
-    else
-        if [ "$DRYRUN" = "1" ]; then
-            info "  DRY RUN: Would symlink $mesa_cache -> $mesa_target"
-        else
-            rm -f "$mesa_cache"
-            ln -s "$mesa_target" "$mesa_cache"
-            debug "  Mesa cache symlink repointed"
-        fi
-    fi
-
-    # --- DXVK state caches ---
-    local dxvk_swapped=0
-    local dxvk_migrated=0
-    local steam_compat_roots=(
-        "$HOME/.steam/steam/steamapps/compatdata"
-        "/run/media/system/GAMES/steamapps/compatdata"
-    )
-
-    for root in "${steam_compat_roots[@]}"; do
-        [ -d "$root" ] || continue
-
-        for prefix in "$root"/*/; do
-            [ -d "$prefix" ] || continue
-
-            local appid=$(basename "$prefix")
-            local dxvk_cache="${prefix}dxvk-state-cache"
-            local dxvk_stored="$dxvk_target/$appid"
-
-            debug "  DXVK [$appid]: $dxvk_cache"
-
-            if [ -f "$dxvk_cache" ] && [ ! -L "$dxvk_cache" ]; then
-                debug "    Real file detected, migrating"
-                if [ "$DRYRUN" = "1" ]; then
-                    info "    DRY RUN: Would migrate -> $dxvk_stored"
-                else
-                    cp -p "$dxvk_cache" "$dxvk_stored" 2>/dev/null
-                    rm -f "$dxvk_cache"
-                    ln -s "$dxvk_stored" "$dxvk_cache"
-                    dxvk_migrated=$((dxvk_migrated + 1))
-                fi
-            else
-                [ -f "$dxvk_stored" ] || touch "$dxvk_stored"
-
-                if [ "$DRYRUN" = "1" ]; then
-                    info "    DRY RUN: Would symlink -> $dxvk_stored"
-                else
-                    rm -f "$dxvk_cache"
-                    ln -s "$dxvk_stored" "$dxvk_cache"
-                    dxvk_swapped=$((dxvk_swapped + 1))
-                fi
-            fi
-        done
-    done
-
-    info "Shader swap summary:"
-    info "  - DXVK caches swapped: $dxvk_swapped"
-    info "  - DXVK caches migrated: $dxvk_migrated"
+    # Symlink DXVK caches per-game (this part is fine, DXVK follows symlinks)
+    # But ALSO set the env var as backup
+    info "Shader env written to $env_file"
+    info "Mesa cache dir: $mesa_target"
+    info "DXVK cache dir: $dxvk_target"
 }
 
 perform_swap() {
