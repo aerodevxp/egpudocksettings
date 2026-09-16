@@ -456,7 +456,7 @@ perform_swap() {
     info "  - Files applied: $apply_count"
     info "  - Files missing: $missing_count"
     
-    swap_shaders "$target_state"
+    #swap_shaders "$target_state"
     
     # Update state
     echo "$target_state" > "$STATE_FILE"

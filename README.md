@@ -17,7 +17,7 @@ Examples:
   ./docksettings.sh -g egpu -d # Dry run (test without changes)
 ```
 
-Clone this repo wherever you'd like your shaders and settings to be backed up. Shaders can take a few GBs of space.
+Clone this repo wherever you'd like your settings to be backed up.
 
 Put 99-...rules file in the /etc/udev/rules.d/ folder.
 
