@@ -92,15 +92,15 @@ crawl_and_register() {
         "/home/deck/.steam/steam/steamapps/common/"
         "/run/media/system/GAMES/steamapps/common/"
     )
-    
+
     for root in "${steam_roots[@]}"; do
         debug "Scanning: $root"
-    
+
         [ ! -d "$root" ] && {
             warn "Directory not found: $root"
             continue
         }
-    
+
         find "$root" \
             -type f \
             -path "*/pfx/drive_c/users/steamuser/*" \
@@ -115,10 +115,10 @@ crawl_and_register() {
             echo "$file" >> "$TEMPFILE"
         done
     done
-    
+
     while IFS= read -r file; do
         lower_file="${file,,}"
-    
+
         if [[ "$lower_file" == *steamlinuxruntime* ]] ||
            [[ "$lower_file" == *proton* ]] ||
            [[ "$lower_file" == *crashreport* ]]; then
@@ -129,19 +129,19 @@ crawl_and_register() {
             ((scanned_count++))
         fi
     done < "$TEMPFILE"
-    
+
     rm -f "$TEMPFILE"
-    
+
     info "Steam zone scan complete. Files found: $scanned_count, Excluded: $excluded_count"
     # =====================================================================
     # 2. CRAWL THE CSV (UNFILTERED - ALL FILES)
     # =====================================================================
     info "========== PHASE 2: CSV SCAN =========="
     debug "CSV file location: $DB"
-    
+
     local csv_files=0
     local csv_excluded=0
-    
+
     if [ -f "$DB" ]; then
         debug "CSV file exists"
         while IFS= read -r entry || [[ -n "$entry" ]]; do
@@ -158,7 +158,7 @@ crawl_and_register() {
                 while IFS= read -r -d '' file; do
                     if [ -n "$file" ]; then
                         local lower_file=$(echo "$file" | tr '[:upper:]' '[:lower:]')
-                        
+
                         if [[ "$lower_file" == *"crashreport"* ]]; then
                             debug "    EXCLUDED: $file"
                             csv_excluded=$((csv_excluded + 1))
@@ -180,7 +180,7 @@ crawl_and_register() {
                 warn "  -> Entry NOT FOUND: $entry"
             fi
         done < "$DB"
-        
+
         info "CSV scan complete. Files from CSV: $csv_files, Excluded: $csv_excluded"
     else
         warn "CSV file not found: $DB"
@@ -194,7 +194,7 @@ crawl_and_register() {
     # 3. REGISTER FILES
     # =====================================================================
     info "========== PHASE 4: REGISTRATION =========="
-    
+
     mkdir -p "$IGPU_PROFILES" "$EGPU_PROFILES" "$BACKUP_DIR"
     touch "$MAP_FILE"
 
@@ -211,14 +211,14 @@ crawl_and_register() {
             skipped_count=$((skipped_count + 1))
         else
             local id="ID_$(($(wc -l < "$MAP_FILE" 2>/dev/null) + 1))"
-            
+
             debug "REGISTERING: $file_path"
             debug "  -> Assigned ID: $id"
-            
+
             echo "$id | $file_path" >> "$MAP_FILE"
 
             local filename=$(basename "$file_path")
-            
+
             # ONLY create profile files if they don't exist
             # This preserves existing configurations!
             if [ -f "$file_path" ]; then
@@ -226,7 +226,7 @@ crawl_and_register() {
                 cp -p "$file_path" "$BACKUP_DIR/${id}_${filename}" 2>/dev/null && \
                     debug "  -> Backup created: ${id}_${filename}" || \
                     warn "  -> Backup FAILED: ${id}_${filename}"
-                
+
                 # iGPU profile - only if doesn't exist
                 if [ ! -f "$IGPU_PROFILES/$id" ]; then
                     cp -p "$file_path" "$IGPU_PROFILES/$id" 2>/dev/null && \
@@ -235,7 +235,7 @@ crawl_and_register() {
                 else
                     debug "  -> iGPU profile EXISTS, preserving"
                 fi
-                
+
                 # eGPU profile - only if doesn't exist
                 if [ ! -f "$EGPU_PROFILES/$id" ]; then
                     cp -p "$file_path" "$EGPU_PROFILES/$id" 2>/dev/null && \
@@ -262,19 +262,19 @@ crawl_and_register() {
     # 4. DISPLAY ALL TRACKED FILES WITH HASHES
     # =====================================================================
     info "========== ALL TRACKED FILES =========="
-    
+
     if [ -f "$MAP_FILE" ]; then
         while IFS='|' read -r id filepath; do
             id="${id#"${id%%[![:space:]]*}"}"
             id="${id%"${id##*[![:space:]]}"}"
-            
+
             filepath="${filepath#"${filepath%%[![:space:]]*}"}"
             filepath="${filepath%"${filepath##*[![:space:]]}"}"
-            
+
             local live_hash=$(file_hash "$filepath")
             local igpu_hash=$(file_hash "$IGPU_PROFILES/$id")
             local egpu_hash=$(file_hash "$EGPU_PROFILES/$id")
-            
+
             echo "  [$id] $filepath"
             debug "      LIVE:  $live_hash"
             debug "      iGPU:  $igpu_hash"
@@ -285,45 +285,50 @@ crawl_and_register() {
     fi
 }
 
-swap_shaders() {
-    local target_state="$1"
-    local mesa_target dxvk_target
+#handle pre-cached shaders from Steam
+swap_steam_fossilize() {
+    local GPU_TAG="$1"
+    local USER_NAME=$(getent passwd 1000 | cut -d: -f1)
+    local STEAM_ROOT
+    STEAM_ROOT=$(sudo -i -u "$USER_NAME" bash -c 'readlink -f ~/.steam/root' 2>/dev/null || echo "/home/${USER_NAME}/.local/share/Steam")
+    local SHADERCACHE="${STEAM_ROOT}/steamapps/shadercache"
 
-    if [ "$target_state" = "egpu" ]; then
-        mesa_target="$MESA_EGPU_SHADER"
-        dxvk_target="$DXVK_EGPU_SHADER"
-    else
-        mesa_target="$MESA_IGPU_SHADER"
-        dxvk_target="$DXVK_IGPU_SHADER"
+    # Create per-GPU storage dirs
+    sudo -u "$USER_NAME" mkdir -p "${SHADERCACHE}.${GPU_TAG}"
+
+    # Remove existing symlink (or empty dir) at the active path
+    if [ -L "$SHADERCACHE" ] || [ -d "$SHADERCACHE" ]; then
+        # If it's a real directory (not a symlink), move its contents to the current GPU's tag
+        if [ -d "$SHADERCACHE" ] && [ ! -L "$SHADERCACHE" ]; then
+            # Detect which GPU tag this cache belongs to (or default to the opposite of where we're going)
+            local CURRENT_TAG
+            if [ "$GPU_TAG" = "egpu" ]; then
+                CURRENT_TAG="igpu"
+            else
+                CURRENT_TAG="egpu"
+            fi
+            sudo -u "$USER_NAME" mkdir -p "${SHADERCACHE}.${CURRENT_TAG}"
+            sudo -u "$USER_NAME" rsync -a --remove-source-files "$SHADERCACHE/" "${SHADERCACHE}.${CURRENT_TAG}/" 2>/dev/null
+            sudo -u "$USER_NAME" find "$SHADERCACHE" -type d -empty -delete 2>/dev/null
+        fi
+        sudo -u "$USER_NAME" rm -rf "$SHADERCACHE"
     fi
 
-    mkdir -p "$mesa_target" "$dxvk_target"
-
-    # Write env vars to a file that gets sourced at game launch
-    local env_file="$DOCK_DIR/current_gpu_env.sh"
-    cat > "$env_file" <<EOF
-export MESA_SHADER_CACHE_DIR="$mesa_target"
-export DXVK_STATE_CACHE_PATH="\$STEAM_COMPAT_DATA_PATH/dxvk-state-cache"
-EOF
-
-    # Symlink DXVK caches per-game (this part is fine, DXVK follows symlinks)
-    # But ALSO set the env var as backup
-    info "Shader env written to $env_file"
-    info "Mesa cache dir: $mesa_target"
-    info "DXVK cache dir: $dxvk_target"
+    # Symlink the target GPU's cache into place
+    sudo -u "$USER_NAME" ln -s "${SHADERCACHE}.${GPU_TAG}" "$SHADERCACHE"
 }
 
 perform_swap() {
     local target_state="$1"
     local current_state=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 
-    
+
 
     info "========== PERFORMING SWAP =========="
     debug "Target state: $target_state"
     debug "Current state (from file): $current_state"
     debug "State file location: $STATE_FILE"
-    
+
     if [ "$target_state" = "$current_state" ] && [ "$current_state" != "unknown" ]; then
         echo "Already in $target_state mode — nothing to do. Files will not be backed up and replaced."
         return 0
@@ -372,7 +377,7 @@ perform_swap() {
         filepath="${filepath#"${filepath%%[![:space:]]*}"}"
         filepath="${filepath%"${filepath##*[![:space:]]}"}"
 
-        
+
         [ -z "$id" ] && continue
         [ -z "$filepath" ] && continue
 
@@ -389,15 +394,15 @@ perform_swap() {
             else
                 local igpu_hash=$(file_hash "$IGPU_PROFILES/$id")
                 local egpu_hash=$(file_hash "$EGPU_PROFILES/$id")
-                
+
                 cp -p "$filepath" "$IGPU_PROFILES/$id" 2>/dev/null && \
                     debug "  -> Backed up to iGPU profile" || \
                     warn "  -> iGPU backup FAILED"
-                
+
                 cp -p "$filepath" "$EGPU_PROFILES/$id" 2>/dev/null && \
                     debug "  -> Backed up to eGPU profile" || \
                     warn "  -> eGPU backup FAILED"
-                
+
                 unknown_backups=$((unknown_backups + 1))
             fi
         fi
@@ -405,12 +410,12 @@ perform_swap() {
         # Normal backup (when current_state is known)
         if [ -n "$save_to_dir" ] && [ -f "$filepath" ]; then
             local target_hash=$(file_hash "$save_to_dir/$id")
-            
+
             if [ "$DRYRUN" = "1" ]; then
                 info "  DRY RUN: Would backup $filepath to $save_to_dir/$id"
             else
                 debug "  Current profile hash: $target_hash"
-                
+
                 if cp -p "$filepath" "$save_to_dir/$id" 2>/dev/null; then
                     local new_hash=$(file_hash "$save_to_dir/$id")
                     debug "  -> Backed up to: $save_to_dir/$id"
@@ -430,12 +435,12 @@ perform_swap() {
         # Apply target profile
         if [ -f "$load_from_dir/$id" ]; then
             local profile_hash=$(file_hash "$load_from_dir/$id")
-            
+
             if [ "$DRYRUN" = "1" ]; then
                 info "  DRY RUN: Would apply $load_from_dir/$id to $filepath"
             else
                 debug "  Profile to apply hash: $profile_hash"
-                
+
                 if cp -p "$load_from_dir/$id" "$filepath" 2>/dev/null; then
                     local applied_hash=$(file_hash "$filepath")
                     debug "  -> Applied profile from: $load_from_dir/$id"
@@ -455,9 +460,9 @@ perform_swap() {
     info "  - Files backed up (first run): $unknown_backups"
     info "  - Files applied: $apply_count"
     info "  - Files missing: $missing_count"
-    
-    #swap_shaders "$target_state"
-    
+
+    swap_steam_fossilize "$target_state"
+
     # Update state
     echo "$target_state" > "$STATE_FILE"
     info "State updated: Now in $target_state mode"
