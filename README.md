@@ -24,7 +24,7 @@ You can also add additional files/folders to track in the .csv file.
 
 You'd ideally want this script to be called whenever you switch GPUs. The udev rule can work for this, but I personally use Steam shortcuts with launch parameters for more direct control.
 
-## Windows
+## Windows (IN ACTIVE DEV - DO NOT USE)
 Windows 10 or higher.
 
 Download/Clone the repository, and run *install.ps1* as ADMIN. It will install the docksettings.ps1 and its folder under C:/docksettings. The script assumes TWO GPUs loaded up means an eGPU is connected. If there's only one, it will load the iGPU settings back.
