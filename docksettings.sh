@@ -39,11 +39,11 @@ CACHE_HOME="${XDG_CACHE_HOME:-$USER_HOME/.cache}"
 MESA_CACHE_LIVE="${MESA_SHADER_CACHE_DIR:-$CACHE_HOME/mesa_shader_cache}"
 VKD3D_CACHE_LIVE="${VKD3D_SHADER_CACHE_PATH:-$CACHE_HOME/vkd3d}"
 
-## Steam roots — CHANGE THIS IF YOU HAVE AN EXTERNAL DRIVE
+## Steam roots — derived from $USER_HOME; external drive stays hardcoded
 STEAM_ROOTS=(
-    "/home/deck/.steam/steam/steamapps/compatdata"
+    "$USER_HOME/.steam/steam/steamapps/compatdata"
     "/run/media/system/GAMES/steamapps/compatdata"
-    "/home/deck/.steam/steam/steamapps/common"
+    "$USER_HOME/.steam/steam/steamapps/common"
     "/run/media/system/GAMES/steamapps/common"
 )
 
@@ -52,6 +52,11 @@ TRUST_LIVE=1    # 1 = trust live files for backup, 0 = skip backup (crash recove
 FORCE_APPLY=0   # 1 = re-apply even if already in target state
 DRYRUN=0
 SKIP_CACHE=0
+DEDUPE=0
+
+## In-run duplicate guards
+declare -A SEEN_PATHS=()
+declare -A SEEN_CACHE=()
 
 ## ==============================================================================
 ## CRASH-SAFE HELPERS
@@ -85,7 +90,6 @@ trim() {
 }
 
 # Expand ~, ~user, $HOME, ${HOME} and other $VARS into an absolute path.
-# Everything that touches a user-supplied path must run through this first.
 normalize_path() {
     local p
     p=$(trim "$1")
@@ -121,6 +125,27 @@ normalize_path() {
     printf '%s' "$p"
 }
 
+# Canonicalise: resolve the parent directory (kills /home vs /var/home, symlinked
+# dirs) but keep the basename so our own cache symlinks are not followed.
+canon_path() {
+    local p d b
+    p=$(normalize_path "$1")
+    [ -z "$p" ] && return 0
+    d=$(dirname "$p")
+    b=$(basename "$p")
+    printf '%s/%s' "$(realpath -m "$d" 2>/dev/null || printf '%s' "$d")" "$b"
+}
+
+# Pull the last igpu/egpu token out of a possibly corrupted state string.
+sanitize_state() {
+    local s
+    s=$(printf '%s' "$1" | grep -oE '\b(igpu|egpu)\b' | tail -1)
+    printf '%s' "${s:-unknown}"
+}
+
+read_state()  { sanitize_state "$(cat "$STATE_FILE" 2>/dev/null)"; }
+read_marker() { sanitize_state "$(cat "$SWAP_MARKER" 2>/dev/null)"; }
+
 # Run a command as the deck user when we're root
 as_user() {
     if [ "$(id -u)" -eq 0 ] && [ "$USER_NAME" != "root" ]; then
@@ -131,10 +156,10 @@ as_user() {
 }
 
 ## ==============================================================================
-## DEBUG HELPERS
+## DEBUG HELPERS — debug goes to STDERR so $(...) capture stays clean
 ## ==============================================================================
 debug() {
-    echo "$DATE [DEBUG] $1"
+    echo "$DATE [DEBUG] $1" >&2
     echo "$DATE [DEBUG] $1" >> "$DOCK_DIR/global.log"
 }
 
@@ -176,10 +201,57 @@ detect_gpu_state() {
     debug "detect_gpu_state: render_nodes=$render_count, gpu_controllers=$gpu_count"
 
     if [ "$render_count" -gt 1 ] || [ "$gpu_count" -gt 1 ]; then
-        echo "egpu"
+        printf 'egpu\n'
     else
-        echo "igpu"
+        printf 'igpu\n'
     fi
+}
+
+## ==============================================================================
+## DEDUPE
+## ==============================================================================
+
+dedupe_maps() {
+    local map id p type canon kept=0 dropped=0
+
+    for map in "$MAP_FILE" "$CACHE_MAP"; do
+        [ -s "$map" ] || continue
+        declare -A keep=()
+        : > "$map.dedup"
+
+        while IFS='|' read -r id p type; do
+            id=$(trim "$id")
+            p=$(trim "$p")
+            type=$(trim "$type")
+            [ -z "$id" ] && continue
+            [ -z "$p" ] && continue
+
+            canon=$(canon_path "$p")
+
+            if [ -n "${keep[$canon]}" ]; then
+                echo "DROP [$id] $p  (duplicate of [${keep[$canon]}])"
+                if [ "$map" = "$MAP_FILE" ]; then
+                    rm -f "$IGPU_PROFILES/$id" "$EGPU_PROFILES/$id"
+                else
+                    rm -rf "$CACHE_IGPU_PROFILES/$id" "$CACHE_EGPU_PROFILES/$id"
+                fi
+                dropped=$((dropped + 1))
+            else
+                keep[$canon]="$id"
+                if [ -n "$type" ]; then
+                    printf '%s | %s | %s\n' "$id" "$canon" "$type" >> "$map.dedup"
+                else
+                    printf '%s | %s\n' "$id" "$canon" >> "$map.dedup"
+                fi
+                kept=$((kept + 1))
+            fi
+        done < <(sort -t_ -k2 -n "$map")
+
+        mv "$map.dedup" "$map"
+        unset keep
+    done
+
+    info "Dedupe complete: $kept kept, $dropped dropped"
 }
 
 ## ==============================================================================
@@ -206,13 +278,14 @@ ensure_cache_profile() {
     fi
 }
 
-# Register a cache path once: seed the current GPU's profile with whatever is
-# live right now, then convert the live path into a symlink into that profile.
 register_cache_entry() {
     local path
-    path=$(normalize_path "$1")
+    path=$(canon_path "$1")
     local type="$2"
     [ -z "$path" ] && return 0
+
+    [ -n "${SEEN_CACHE[$path]}" ] && return 0
+    SEEN_CACHE[$path]=1
 
     local existing
     existing=$(cache_id_for_path "$path")
@@ -221,7 +294,6 @@ register_cache_entry() {
         return 0
     fi
 
-    # Allocate a non-colliding cache ID
     local n
     n=$(grep -c '^C_' "$CACHE_MAP" 2>/dev/null)
     [ -z "$n" ] && n=0
@@ -233,7 +305,6 @@ register_cache_entry() {
 
     if [ "$DRYRUN" = "1" ]; then
         info "  DRY RUN: Would register cache [$cid] ($type) $path"
-        echo "$cid | $path | $type" >> "$CACHE_MAP"
         return 0
     fi
 
@@ -289,7 +360,7 @@ swap_cache() {
 
     while IFS='|' read -r cid path type; do
         cid=$(trim "$cid")
-        path=$(normalize_path "$path")
+        path=$(canon_path "$path")
         type=$(trim "$type")
         [ -z "$cid" ] && continue
         [ -z "$path" ] && continue
@@ -363,14 +434,12 @@ EOF
         info "Created cache DB template: $CACHE_DB"
     fi
 
-    # Built-in driver caches (covers both old and new Mesa cache dir names)
     for m in "$CACHE_HOME"/mesa_shader_cache*; do
         [ -e "$m" ] && register_cache_entry "$m" "dir"
     done
     register_cache_entry "$VKD3D_CACHE_LIVE" "dir"
     [ -n "$DXVK_STATE_CACHE_PATH" ] && register_cache_entry "$DXVK_STATE_CACHE_PATH" "dir"
 
-    # User-supplied cache list
     if [ -f "$CACHE_DB" ]; then
         while IFS= read -r entry || [ -n "$entry" ]; do
             entry=$(trim "$entry")
@@ -391,7 +460,6 @@ EOF
         done < "$CACHE_DB"
     fi
 
-    # Auto-discover per-game DXVK / VKD3D pipeline caches
     for root in "${STEAM_ROOTS[@]}"; do
         [ -d "$root" ] || continue
         debug "Cache scan: $root"
@@ -416,9 +484,6 @@ crawl_and_register() {
     local scanned_count=0
     local excluded_count=0
 
-    # =====================================================================
-    # 1. CRAWL THE STEAM PREFIXS
-    # =====================================================================
     info "========== PHASE 1: STEAM ZONE SCAN =========="
     > "$TEMPFILE"
 
@@ -458,9 +523,6 @@ crawl_and_register() {
 
     info "Steam zone scan complete. Files found: $scanned_count, Excluded: $excluded_count"
 
-    # =====================================================================
-    # 2. CRAWL THE CSV (UNFILTERED - ALL FILES)
-    # =====================================================================
     info "========== PHASE 2: CSV SCAN =========="
     debug "CSV file location: $DB"
 
@@ -517,16 +579,10 @@ crawl_and_register() {
     info "========== PHASE 3: TOTAL FILES =========="
     info "Total unique files discovered: ${#found_files[@]}"
 
-    # =====================================================================
-    # 3. REGISTER FILES
-    # =====================================================================
     info "========== PHASE 4: REGISTRATION =========="
 
     mkdir -p "$IGPU_PROFILES" "$EGPU_PROFILES" "$BACKUP_DIR"
     touch "$MAP_FILE"
-
-    local existing_count=$(wc -l < "$MAP_FILE" 2>/dev/null || echo 0)
-    debug "Existing map entries: $existing_count"
 
     local registered_count=0
     local skipped_count=0
@@ -534,45 +590,66 @@ crawl_and_register() {
     for file_path in "${found_files[@]}"; do
         [ -z "$file_path" ] && continue
 
+        file_path=$(canon_path "$file_path")
+        [ -z "$file_path" ] && continue
+
+        # in-run duplicate guard (CSV often lists a file and its parent dir)
+        if [ -n "${SEEN_PATHS[$file_path]}" ]; then
+            skipped_count=$((skipped_count + 1))
+            continue
+        fi
+        SEEN_PATHS[$file_path]=1
+
         if grep -qF "$file_path" "$MAP_FILE" 2>/dev/null; then
             skipped_count=$((skipped_count + 1))
-        else
-            local id="ID_$(($(wc -l < "$MAP_FILE" 2>/dev/null) + 1))"
+            continue
+        fi
 
-            debug "REGISTERING: $file_path"
-            debug "  -> Assigned ID: $id"
+        local id="ID_$(($(grep -c '^ID_' "$MAP_FILE" 2>/dev/null || echo 0) + 1))"
+        while grep -q "^${id} |" "$MAP_FILE" 2>/dev/null; do
+            id="ID_$((${id#ID_} + 1))"
+        done
 
-            echo "$id | $file_path" >> "$MAP_FILE"
+        debug "REGISTERING: $file_path"
+        debug "  -> Assigned ID: $id"
 
-            local filename=$(basename "$file_path")
+        if [ "$DRYRUN" = "1" ]; then
+            info "  DRY RUN: Would register [$id] $file_path"
+            printf '%s | %s\n' "$id" "$file_path" >> "$MAP_FILE"
+            registered_count=$((registered_count + 1))
+            continue
+        fi
 
-            if [ -f "$file_path" ]; then
-                cp -p "$file_path" "$BACKUP_DIR/${id}_${filename}" 2>/dev/null && \
-                    debug "  -> Backup created: ${id}_${filename}" || \
-                    warn "  -> Backup FAILED: ${id}_${filename}"
+        echo "$id | $file_path" >> "$MAP_FILE"
 
-                if [ ! -f "$IGPU_PROFILES/$id" ]; then
-                    cp -p "$file_path" "$IGPU_PROFILES/$id" 2>/dev/null && \
-                        debug "  -> iGPU profile created (NEW)" || \
-                        warn "  -> iGPU profile FAILED"
-                else
-                    debug "  -> iGPU profile EXISTS, preserving"
-                fi
+        local filename=$(basename "$file_path")
 
-                if [ ! -f "$EGPU_PROFILES/$id" ]; then
-                    cp -p "$file_path" "$EGPU_PROFILES/$id" 2>/dev/null && \
-                        debug "  -> eGPU profile created (NEW)" || \
-                        warn "  -> eGPU profile FAILED"
-                else
-                    debug "  -> eGPU profile EXISTS, preserving"
-                fi
+        if [ -f "$file_path" ]; then
+            cp -p "$file_path" "$BACKUP_DIR/${id}_${filename}" 2>/dev/null && \
+                debug "  -> Backup created: ${id}_${filename}" || \
+                warn "  -> Backup FAILED: ${id}_${filename}"
+
+            if [ ! -f "$IGPU_PROFILES/$id" ]; then
+                cp -p "$file_path" "$IGPU_PROFILES/$id" 2>/dev/null && \
+                    debug "  -> iGPU profile created (NEW)" || \
+                    warn "  -> iGPU profile FAILED"
             else
-                warn "  -> Source file does not exist: $file_path"
+                debug "  -> iGPU profile EXISTS, preserving"
             fi
 
-            registered_count=$((registered_count + 1))
-            echo "TRACKED: $file_path"
+            if [ ! -f "$EGPU_PROFILES/$id" ]; then
+                cp -p "$file_path" "$EGPU_PROFILES/$id" 2>/dev/null && \
+                    debug "  -> eGPU profile created (NEW)" || \
+                    warn "  -> eGPU profile FAILED"
+            else
+                debug "  -> eGPU profile EXISTS, preserving"
+            fi
+        else
+            warn "  -> Source file does not exist: $file_path"
         fi
+
+        registered_count=$((registered_count + 1))
+        echo "TRACKED: $file_path"
     done
 
     info "Registration complete"
@@ -580,10 +657,7 @@ crawl_and_register() {
     info "  - Already tracked: $skipped_count"
     info "  - Total in map: $(wc -l < "$MAP_FILE" 2>/dev/null || echo 0)"
 
-    # =====================================================================
-    # 4. DRIFT DETECTION
-    # =====================================================================
-    local file_state=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
+    local file_state=$(read_state)
     local hw_state=$(detect_gpu_state)
 
     if [ "$FORCE_APPLY" = "1" ]; then
@@ -630,15 +704,13 @@ crawl_and_register() {
         fi
     fi
 
-    # =====================================================================
-    # 5. DISPLAY ALL TRACKED FILES WITH HASHES
-    # =====================================================================
     info "========== ALL TRACKED FILES =========="
 
     if [ -f "$MAP_FILE" ]; then
         while IFS='|' read -r id filepath; do
             id=$(trim "$id")
             filepath=$(trim "$filepath")
+            [ -z "$id" ] && continue
 
             local live_hash=$(file_hash "$filepath")
             local igpu_hash=$(file_hash "$IGPU_PROFILES/$id")
@@ -675,7 +747,8 @@ crawl_and_register() {
 ## SHADER / FOSSILIZE CACHE SWAP
 ## ==============================================================================
 swap_steam_fossilize() {
-    local GPU_TAG="$1"
+    local GPU_TAG
+    GPU_TAG=$(sanitize_state "$1")
 
     local SUDO=""
     if [ "$(id -u)" -ne "$USER_UID" ]; then
@@ -687,6 +760,14 @@ swap_steam_fossilize() {
     local SHADERCACHE="${STEAM_ROOT}/steamapps/shadercache"
 
     debug "swap_steam_fossilize: GPU_TAG=$GPU_TAG, STEAM_ROOT=$STEAM_ROOT"
+
+    # Purge junk dirs from pre-fix runs (names contained [DEBUG] and newlines)
+    local junk
+    for junk in "${SHADERCACHE}."*DEBUG*; do
+        [ -d "$junk" ] || continue
+        warn "Removing junk shadercache dir: $(basename "$junk")"
+        $SUDO rm -rf "$junk"
+    done
 
     $SUDO mkdir -p "${SHADERCACHE}.${GPU_TAG}"
 
@@ -718,11 +799,18 @@ swap_steam_fossilize() {
 ## ==============================================================================
 
 perform_swap() {
-    local target_state="$1"
-    local current_state=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
+    local target_state
+    target_state=$(sanitize_state "$1")
+    local current_state
+    current_state=$(read_state)
 
     info "========== PERFORMING SWAP =========="
     debug "Target: $target_state / Current: $current_state / TRUST_LIVE: $TRUST_LIVE / FORCE_APPLY: $FORCE_APPLY"
+
+    if [ "$target_state" = "unknown" ]; then
+        error "Target state is unknown — aborting swap"
+        return 1
+    fi
 
     if [ "$target_state" = "$current_state" ] && [ "$current_state" != "unknown" ]; then
         if [ "$FORCE_APPLY" != "1" ]; then
@@ -750,6 +838,8 @@ perform_swap() {
             debug "First run — backing up to BOTH profiles"
         fi
     fi
+
+    debug "Save to: ${save_to_dir:-<none>} / Load from: $load_from_dir"
 
     if [ "$DRYRUN" != "1" ]; then
         atomic_write "$target_state" "$SWAP_MARKER"
@@ -835,7 +925,6 @@ perform_swap() {
     info "  - Files applied: $apply_count"
     info "  - Files missing: $missing_count"
 
-    # ---- Cache swap (symlink repoint) ----
     if [ "$SKIP_CACHE" = "1" ]; then
         info "Cache swap skipped (-n)"
     else
@@ -861,7 +950,7 @@ perform_swap() {
 ## ==============================================================================
 
 help() {
-    echo "ROG Ally X Absolute GPU Automation v1.31"
+    echo "ROG Ally X Absolute GPU Automation v1.32"
     echo "-----------------------------------------"
     echo "Usage: $0 [options]"
     echo ""
@@ -870,13 +959,14 @@ help() {
     echo "  -f          Force re-apply even if already in target state"
     echo "  -d          Dry run: log changes without writing"
     echo "  -n          Skip cache swap (configs + shader cache only)"
+    echo "  -D          Dedupe maps (collapse /home vs /var/home dupes), then exit"
     echo "  -h          Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0 -g egpu         # Switch to eGPU (configs + all caches)"
     echo "  $0 -g igpu         # Switch to iGPU (configs + all caches)"
-    echo "  $0 -g igpu -f      # Force re-apply iGPU profiles"
     echo "  $0 -g egpu -d      # Dry run (test without changes)"
+    echo "  $0 -D              # Collapse duplicate map entries"
     echo ""
     echo "Caches:"
     echo "  Shader/pipeline caches are swapped via symlinks (no copies)."
@@ -885,14 +975,14 @@ help() {
     echo "  Paths there accept ~, \$HOME, or absolute paths."
     echo ""
     echo "State file: $STATE_FILE"
-    echo "  Current state: $(cat "$STATE_FILE" 2>/dev/null || echo "unknown")"
+    echo "  Current state: $(read_state)"
 }
 
 ## ==============================================================================
 ## ARGUMENT PARSING
 ## ==============================================================================
 
-while getopts "hufg:dn" option; do
+while getopts "hufg:dnD" option; do
     case $option in
         h) help; exit 0;;
         u) ;;
@@ -900,6 +990,7 @@ while getopts "hufg:dn" option; do
         g) GPU_OVERRIDE="$OPTARG";;
         d) DRYRUN=1;;
         n) SKIP_CACHE=1;;
+        D) DEDUPE=1;;
         \?) error "Invalid option"; exit 1;;
     esac
 done
@@ -909,7 +1000,7 @@ done
 ## ==============================================================================
 
 debug "========== SCRIPT STARTING =========="
-debug "Arguments: $* / GPU_OVERRIDE: ${GPU_OVERRIDE:-not set} / DRYRUN: $DRYRUN / FORCE_APPLY: $FORCE_APPLY"
+debug "Arguments: $* / GPU_OVERRIDE: ${GPU_OVERRIDE:-not set} / DRYRUN: $DRYRUN / FORCE_APPLY: $FORCE_APPLY / DEDUPE: $DEDUPE"
 
 mkdir -p "$LOCKDIR"
 LOCKFILE="$LOCKDIR/global.lock"
@@ -932,13 +1023,20 @@ if [ ! -f "$STATE_FILE" ]; then
     atomic_write "unknown" "$STATE_FILE"
 fi
 
+# Dedupe mode: fix the maps, then stop
+if [ "$DEDUPE" = "1" ]; then
+    mkdir -p "$DOCK_DIR"
+    dedupe_maps
+    exit 0
+fi
+
 HARDWARE_STATE=$(detect_gpu_state)
-FILE_STATE=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
+FILE_STATE=$(read_state)
 
 debug "Hardware state: $HARDWARE_STATE / State file: $FILE_STATE"
 
 if [ -f "$SWAP_MARKER" ]; then
-    INTERRUPTED_TARGET=$(cat "$SWAP_MARKER" 2>/dev/null || echo "unknown")
+    INTERRUPTED_TARGET=$(read_marker)
     warn "=== CRASH RECOVERY ==="
     warn "  Previous swap to '$INTERRUPTED_TARGET' was interrupted!"
     warn "  Hardware currently reports: $HARDWARE_STATE"
@@ -963,13 +1061,9 @@ elif [ "$FILE_STATE" != "$HARDWARE_STATE" ] && [ "$FILE_STATE" != "unknown" ]; t
     GPU_OVERRIDE="$HARDWARE_STATE"
 fi
 
-# 1. Crawl + register config files
 crawl_and_register
-
-# 2. Crawl + register cache paths
 crawl_and_register_caches
 
-# 3. Swap
 if [ -n "$GPU_OVERRIDE" ]; then
     perform_swap "$GPU_OVERRIDE"
 else
