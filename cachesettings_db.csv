@@ -1,0 +1,32 @@
+# Accepted path forms (all equivalent for your own home):
+#   ~/.cache/yuzu
+#   $HOME/.cache/yuzu
+#   ${HOME}/.cache/yuzu
+#   /home/deck/.cache/yuzu
+#   .cache/yuzu            (bare relative anchors to your home, not CWD)
+# Other users' homes: ~bob/.cache/foo
+#
+# A missing path is fine — it gets registered and created on the next swap.
+# Type (dir vs file) is auto-detected; missing paths default to dir.
+# No globbing — write one literal path per line, not ~/.cache/yuzu/*
+#
+# NOT needed here (auto-tracked by the script):
+#   mesa shader cache(s), vkd3d cache, steam fossilize cache,
+#   every *.dxvk-cache / *.vkd3d.cache inside prefixes or game dirs
+#
+# ===== Emulators =====
+$HOME/.cache/rpcs3
+${HOME}/.cache/dolphin-emu
+~/.cache/PCSX2
+~/.local/share/Cemu/shaderCache
+~/.cache/Vita3K
+~/.cache/shadPS4
+~/.local/share/xenia
+~/.cache/lichii/shader
+~/.cache/eden/shader
+
+# ===== Misc tooling caches worth isolating =====
+~/.cache/winetricks
+~/.cache/vkBasalt
+
+# === Add more here ===
