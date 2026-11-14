@@ -84,6 +84,43 @@ trim() {
     printf '%s' "$s"
 }
 
+# Expand ~, ~user, $HOME, ${HOME} and other $VARS into an absolute path.
+# Everything that touches a user-supplied path must run through this first.
+normalize_path() {
+    local p
+    p=$(trim "$1")
+    [ -z "$p" ] && return 0
+
+    case "$p" in
+        "~")    p="$USER_HOME" ;;
+        "~/"*)  p="$USER_HOME/${p:2}" ;;
+        "~"*)
+            local u="${p%%/*}" rest=""
+            [[ "$p" == */* ]] && rest="/${p#*/}"
+            local uh
+            uh=$(getent passwd "${u#\~}" 2>/dev/null | cut -d: -f6)
+            if [ -n "$uh" ]; then
+                p="$uh$rest"
+            else
+                warn "Unknown user in path '${u#\~}', assuming $USER_HOME"
+                p="$USER_HOME$rest"
+            fi
+            ;;
+    esac
+
+    p="${p/#\$\{HOME\}/$USER_HOME}"
+    p="${p/#\$HOME/$USER_HOME}"
+
+    if [[ "$p" == *'$'* ]] && command -v envsubst &>/dev/null; then
+        p=$(printf '%s' "$p" | envsubst)
+    fi
+
+    [[ "$p" != /* ]] && p="$USER_HOME/$p"
+    while [[ "$p" == */ && "$p" != "/" ]]; do p="${p%/}"; done
+
+    printf '%s' "$p"
+}
+
 # Run a command as the deck user when we're root
 as_user() {
     if [ "$(id -u)" -eq 0 ] && [ "$USER_NAME" != "root" ]; then
@@ -173,7 +210,7 @@ ensure_cache_profile() {
 # live right now, then convert the live path into a symlink into that profile.
 register_cache_entry() {
     local path
-    path=$(trim "$1")
+    path=$(normalize_path "$1")
     local type="$2"
     [ -z "$path" ] && return 0
 
@@ -252,7 +289,7 @@ swap_cache() {
 
     while IFS='|' read -r cid path type; do
         cid=$(trim "$cid")
-        path=$(trim "$path")
+        path=$(normalize_path "$path")
         type=$(trim "$type")
         [ -z "$cid" ] && continue
         [ -z "$path" ] && continue
@@ -308,17 +345,20 @@ crawl_and_register_caches() {
 # cachesettings_db.csv — one cache path per line (directory or file).
 # Lines starting with # are ignored.
 #
+# Paths may be absolute, or start with ~ / $HOME for your home directory.
+# A missing path is fine — it gets registered and created on the next swap.
+#
 # Always tracked automatically:
 #   mesa shader cache(s), vkd3d cache, steam fossilize cache,
 #   every *.dxvk-cache / *.vkd3d.cache found in Steam prefixes/game dirs.
 #
 # Add emulator / custom caches below (uncomment the ones you use):
-#/home/deck/.cache/yuzu
-#/home/deck/.cache/rpcs3
-#/home/deck/.local/share/Cemu/shaderCache
-#/home/deck/.cache/dolphin-emu
-#/home/deck/.config/Ryujinx/games
-#/home/deck/.cache/PCSX2
+#~/.cache/yuzu
+#~/.cache/rpcs3
+#~/.local/share/Cemu/shaderCache
+#~/.cache/dolphin-emu
+#~/.config/Ryujinx/games
+#~/.cache/PCSX2
 EOF
         info "Created cache DB template: $CACHE_DB"
     fi
@@ -336,6 +376,10 @@ EOF
             entry=$(trim "$entry")
             [ -z "$entry" ] && continue
             [[ "$entry" == \#* ]] && continue
+
+            entry=$(normalize_path "$entry")
+            [ -z "$entry" ] && continue
+
             if [ -d "$entry" ]; then
                 register_cache_entry "$entry" "dir"
             elif [ -f "$entry" ]; then
@@ -425,8 +469,11 @@ crawl_and_register() {
 
     if [ -f "$DB" ]; then
         while IFS= read -r entry || [[ -n "$entry" ]]; do
-            entry="${entry#"${entry%%[![:space:]]*}"}"
-            entry="${entry%"${entry##*[![:space:]]}"}"
+            entry=$(trim "$entry")
+            [ -z "$entry" ] && continue
+            [[ "$entry" == \#* ]] && continue
+
+            entry=$(normalize_path "$entry")
             [ -z "$entry" ] && continue
 
             debug "  CSV entry: '$entry'"
@@ -814,7 +861,7 @@ perform_swap() {
 ## ==============================================================================
 
 help() {
-    echo "ROG Ally X Absolute GPU Automation v1.30"
+    echo "ROG Ally X Absolute GPU Automation v1.31"
     echo "-----------------------------------------"
     echo "Usage: $0 [options]"
     echo ""
@@ -835,6 +882,7 @@ help() {
     echo "  Shader/pipeline caches are swapped via symlinks (no copies)."
     echo "  Always tracked: mesa, vkd3d, steam fossilize, per-game dxvk caches."
     echo "  Add emulator/custom caches to: $CACHE_DB"
+    echo "  Paths there accept ~, \$HOME, or absolute paths."
     echo ""
     echo "State file: $STATE_FILE"
     echo "  Current state: $(cat "$STATE_FILE" 2>/dev/null || echo "unknown")"
