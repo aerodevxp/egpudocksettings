@@ -8,3 +8,5 @@
 ~/Games/DKB/game/dkb.ini
 ~/.config/lichii/qt-config.ini 
 ~/.config/gamescope/modes.cfg 
+#change your userid to your steam user id
+~/.local/share/Steam/userdata/userid/config/localconfig.vdf
